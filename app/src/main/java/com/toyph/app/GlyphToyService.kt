@@ -3,11 +3,16 @@ package com.toyph.app
 import android.app.Service
 import android.content.ComponentName
 import android.content.Intent
+import android.media.AudioManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.Message
 import android.os.Messenger
+import android.os.SystemClock
+import java.util.Calendar
+import com.toyph.app.modes.ModeRenderer
+import com.toyph.app.modes.ShakeDetector
 import android.util.Log
 import com.toyph.app.effects.CrtShimmerEffect
 import com.toyph.app.effects.Effect
@@ -28,6 +33,7 @@ import com.toyph.app.sequence.GlyphItem
 import com.toyph.app.sequence.ScrollingTextItem
 import com.toyph.app.sequence.SequenceItem
 import com.toyph.app.util.TextBitmapRenderer
+import com.toyph.app.util.GridConstants.MAX_BRIGHTNESS
 import com.nothing.ketchum.Glyph
 import com.nothing.ketchum.GlyphMatrixManager
 import com.nothing.ketchum.GlyphToy
@@ -35,12 +41,24 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 class GlyphToyService : Service() {
     private var manager: GlyphMatrixManager? = null
     private val pipelineScope = CoroutineScope(Dispatchers.IO)
     private var pipelineJob: Job? = null
+
+    private enum class Mode { CLOCK, MUSIC, ANIMATION }
+
+    private var supervisorJob: Job? = null
+    private var modeJob: Job? = null
+    private var currentMode: Mode? = null
+    @Volatile private var animationUntil = 0L
+    private lateinit var audioManager: AudioManager
+    private var shakeDetector: ShakeDetector? = null
 
     private lateinit var config: ToyConfig
 
@@ -146,6 +164,74 @@ class GlyphToyService : Service() {
         pipelineJob = null
     }
 
+    private fun showFrame(frame: IntArray) {
+        for (i in frame.indices) frame[i] = frame[i].coerceIn(0, MAX_BRIGHTNESS)
+        manager?.setMatrixFrame(frame)
+    }
+
+    private fun startSupervisor() {
+        if (supervisorJob?.isActive == true) return
+        shakeDetector = ShakeDetector(this) {
+            val now = SystemClock.elapsedRealtime()
+            if (!audioManager.isMusicActive && now >= animationUntil) {
+                animationUntil = now + ANIMATION_MS
+            }
+        }.also { it.start() }
+
+        supervisorJob = pipelineScope.launch {
+            while (isActive) {
+                val now = SystemClock.elapsedRealtime()
+                val wanted = when {
+                    audioManager.isMusicActive -> Mode.MUSIC
+                    now < animationUntil -> Mode.ANIMATION
+                    else -> Mode.CLOCK
+                }
+                if (wanted != currentMode) switchTo(wanted)
+                delay(250)
+            }
+        }
+    }
+
+    private fun stopSupervisor() {
+        supervisorJob?.cancel()
+        supervisorJob = null
+        shakeDetector?.stop()
+        shakeDetector = null
+        stopMode()
+    }
+
+    private fun stopMode() {
+        stopPipeline()
+        modeJob?.cancel()
+        modeJob = null
+        currentMode = null
+    }
+
+    private fun switchTo(mode: Mode) {
+        stopMode()
+        currentMode = mode
+        when (mode) {
+            Mode.ANIMATION -> startPipeline()
+            Mode.MUSIC -> {
+                animationUntil = 0L
+                modeJob = pipelineScope.launch {
+                    val eq = ModeRenderer.Equalizer()
+                    while (isActive) {
+                        showFrame(eq.nextFrame())
+                        delay(60)
+                    }
+                }
+            }
+            Mode.CLOCK -> modeJob = pipelineScope.launch {
+                while (isActive) {
+                    val cal = Calendar.getInstance()
+                    showFrame(ModeRenderer.clockFrame(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE)))
+                    delay(1000L - (System.currentTimeMillis() % 1000L))
+                }
+            }
+        }
+    }
+
     private val serviceHandler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
             when (msg.what) {
@@ -153,9 +239,7 @@ class GlyphToyService : Service() {
                     val event = msg.data?.getString(GlyphToy.MSG_GLYPH_TOY_DATA)
                     when (event) {
                         GlyphToy.EVENT_AOD, GlyphToy.EVENT_CHANGE -> {
-                            if (pipelineJob == null || pipelineJob?.isActive != true) {
-                                startPipeline()
-                            }
+                            startSupervisor()
                         }
                     }
                 }
@@ -169,6 +253,7 @@ class GlyphToyService : Service() {
         val configJson = assets.open(configFile).bufferedReader().use { it.readText() }
         config = ToyConfig.parse(configJson)
 
+        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         manager = GlyphMatrixManager.getInstance(this)
         manager?.init(object : GlyphMatrixManager.Callback {
             override fun onServiceConnected(componentName: ComponentName) {
@@ -180,7 +265,7 @@ class GlyphToyService : Service() {
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
-        stopPipeline()
+        stopSupervisor()
         pipelineScope.cancel()
         manager?.unInit()
         manager = null
@@ -189,5 +274,6 @@ class GlyphToyService : Service() {
 
     companion object {
         private const val TAG = "GlyphToyService"
+        private const val ANIMATION_MS = 15_000L
     }
 }
